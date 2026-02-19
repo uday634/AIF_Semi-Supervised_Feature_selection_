@@ -190,7 +190,7 @@ roc_data = []
 for fname in datasets:
     path = os.path.join(DATASET_DIR, fname)
     ds_name = fname
-    print(f"\n{'='*50}\n{ds_name} (10 runs)\n{'='*50}")
+    print(f"\n{'='*50}\n{ds_name} (30 runs)\n{'='*50}")
 
     run_metrics = []
     run_rocs = []  # Save best run ROC (or average if needed)
