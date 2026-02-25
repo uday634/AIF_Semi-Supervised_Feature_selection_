@@ -81,8 +81,8 @@ def run_dataset_once(path: str, seed: int):
 
     # Models with per-method time measurement
     aif = OriginalAIF(schema, window_size=256, n_trees=50, seed=seed)
-    aif_log = AdaptiveIsolationForestWithLogisticFS(schema, window_size=256, n_trees=50, seed=seed, label_budget=0.025)
-    aif_anova = AdaptiveIsolationForestWithAnovaFS(schema, window_size=256, n_trees=50, seed=seed, label_budget=0.025)
+    aif_log = AdaptiveIsolationForestWithLogisticFS(schema, window_size=512, n_trees=50, seed=seed, label_budget=0.025)
+    aif_anova = AdaptiveIsolationForestWithAnovaFS(schema, window_size=512, n_trees=50, seed=seed, label_budget=0.025)
 
     y_true = []
     scores_aif = []
