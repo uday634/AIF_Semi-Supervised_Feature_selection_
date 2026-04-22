@@ -1,4 +1,5 @@
-# experiment_score_vs_baseline.py - FINAL VERSION WITH TIME & MEMORY TRACKING
+# experiment_aif_vs_globalLS.py
+# UPDATED: Only compare Original AIF vs Global Logistic Selection (River)
 import os
 import time
 import psutil
@@ -15,15 +16,18 @@ from functools import partial
 from capymoa.instance import Instance
 from capymoa.stream import Schema
 
-from capymoa.anomaly.adaptive_isolation_forest_logistic_fs import AdaptiveIsolationForestWithLogisticFS
-from capymoa.anomaly.adaptive_isolation_forest_logistic_fs_tournament import TournamentBasedLogisticFS
+# ====================== Import Models ======================
+from capymoa.anomaly._adaptive_isolation_forest import AdaptiveIsolationForest as OriginalAIF
+
+# Global Logistic Selection (River-based - the global/online version)
+from capymoa.anomaly.AdaptiveIsolationForestWithLogisticFSGlobal import AdaptiveIsolationForestWithLogisticFS
 
 
 class NPZStream:
     def __init__(self, path):
         data = np.load(path)
         X = data["X"].astype(np.float64)
-        y = data["y"]
+        y = data["y"].ravel()
 
         self.le = LabelEncoder()
         y_idx = self.le.fit_transform(y)
@@ -51,122 +55,139 @@ class NPZStream:
 
 
 def run_single_dataset(ds_name, label_budget=0.025, n_runs=10, window_size=256):
-    """Run one dataset with 10 runs - returns summary including time and memory"""
+    """Run one dataset comparing Original AIF vs GlobalLS (River)"""
     path = os.path.join("./semi_supervised_Datasets", ds_name)
 
-    auc_score_runs = []
-    auc_base_runs = []
+    auc_orig_runs = []
+    auc_globalLS_runs = []
     time_runs = []
     mem_runs = []
 
-    rolling_auc_score_all = []
-    rolling_auc_base_all = []
+    # Store per-run rolling AUCs for variance analysis
+    all_rolling_orig = []
+    all_rolling_globalLS = []
 
     for run in range(n_runs):
         stream = NPZStream(path)
         seed = 42 + run * 13
 
-        model_score = TournamentBasedLogisticFS(
+        # ====================== Initialize Models ======================
+        model_orig = OriginalAIF(
             schema=stream.schema,
             window_size=window_size,
-            label_budget=label_budget,
-            seed=seed,
-            n_trees=100
+            n_trees=100,
+            seed=seed
         )
 
-        model_base = AdaptiveIsolationForestWithLogisticFS(
+        model_globalLS = AdaptiveIsolationForestWithLogisticFS(
             schema=stream.schema,
             window_size=window_size,
-            label_budget=label_budget,
+            n_trees=100,
             seed=seed,
-            n_trees=100
+            label_budget=label_budget,
+            l1_strength=0.1          # River L1 strength (tunable)
         )
 
         y_true = []
-        scores_score = []
-        scores_base = []
+        scores_orig = []
+        scores_globalLS = []
 
         rolling_y = []
-        rolling_scores_score = []
-        rolling_scores_base = []
-        run_rolling_score = []
-        run_rolling_base = []
+        rolling_orig = []
+        rolling_globalLS = []
+
+        run_rolling_orig = []
+        run_rolling_globalLS = []
 
         start_time = time.time()
-        start_mem = psutil.Process().memory_info().rss / (1024 * 1024)  # MB
+        start_mem = psutil.Process().memory_info().rss / (1024 * 1024)
 
         while stream.has_more_instances():
             inst, true_y = stream.next_instance()
+
             y_true.append(true_y)
             rolling_y.append(true_y)
 
-            s_score = model_score.score_instance(inst)
-            s_base = model_base.score_instance(inst)
+            # Score instances
+            s_orig = model_orig.score_instance(inst)
+            s_globalLS = model_globalLS.score_instance(inst)
 
-            scores_score.append(s_score)
-            scores_base.append(s_base)
-            rolling_scores_score.append(s_score)
-            rolling_scores_base.append(s_base)
+            scores_orig.append(s_orig)
+            scores_globalLS.append(s_globalLS)
 
-            model_score.train(inst, true_y)
-            model_base.train(inst, true_y)
+            rolling_orig.append(s_orig)
+            rolling_globalLS.append(s_globalLS)
+
+            # Train models
+            model_orig.train(inst)
+            model_globalLS.train(inst, true_y)   # GlobalLS learns online on labeled data
 
             # Rolling AUC every 50 instances
             if len(rolling_y) % 50 == 0 and len(np.unique(rolling_y)) > 1:
-                auc_s = auc(*roc_curve(rolling_y, rolling_scores_score)[:2])
-                auc_b = auc(*roc_curve(rolling_y, rolling_scores_base)[:2])
-                run_rolling_score.append(auc_s)
-                run_rolling_base.append(auc_b)
+                fpr, tpr, _ = roc_curve(rolling_y, rolling_orig)
+                auc_o = auc(fpr, tpr)
 
-        end_time = time.time()
-        end_mem = psutil.Process().memory_info().rss / (1024 * 1024)
+                fpr, tpr, _ = roc_curve(rolling_y, rolling_globalLS)
+                auc_g = auc(fpr, tpr)
 
-        elapsed = end_time - start_time
-        mem_delta = end_mem - start_mem
+                run_rolling_orig.append(auc_o)
+                run_rolling_globalLS.append(auc_g)
 
-        final_auc_score = auc(*roc_curve(y_true, scores_score)[:2]) if len(np.unique(y_true)) > 1 else 0.5
-        final_auc_base = auc(*roc_curve(y_true, scores_base)[:2]) if len(np.unique(y_true)) > 1 else 0.5
+        # Record time and memory
+        elapsed = time.time() - start_time
+        mem_delta = psutil.Process().memory_info().rss / (1024 * 1024) - start_mem
 
-        auc_score_runs.append(final_auc_score)
-        auc_base_runs.append(final_auc_base)
+        # Final AUC
+        def safe_auc(y_true, scores):
+            if len(np.unique(y_true)) > 1:
+                fpr, tpr, _ = roc_curve(y_true, scores)
+                return auc(fpr, tpr)
+            return 0.5
+
+        auc_orig_runs.append(safe_auc(y_true, scores_orig))
+        auc_globalLS_runs.append(safe_auc(y_true, scores_globalLS))
         time_runs.append(elapsed)
         mem_runs.append(mem_delta)
 
-        rolling_auc_score_all.append(run_rolling_score)
-        rolling_auc_base_all.append(run_rolling_base)
+        all_rolling_orig.append(run_rolling_orig)
+        all_rolling_globalLS.append(run_rolling_globalLS)
 
-    # Average rolling AUC
-    max_len = max((len(lst) for lst in rolling_auc_score_all), default=0)
-    avg_rolling_score = np.zeros(max_len)
-    avg_rolling_base = np.zeros(max_len)
-    count = np.zeros(max_len)
+    # ====================== Save Per-Run Rolling AUC to CSV ======================
+    os.makedirs("rolling_auc_csv_aif_vs_globalLS", exist_ok=True)
+    ds_safe = ds_name.replace('.npz', '').replace('-', '_').replace('.', '_')
 
-    for lst in rolling_auc_score_all:
-        for i, val in enumerate(lst):
-            avg_rolling_score[i] += val
-            count[i] += 1
-    for lst in rolling_auc_base_all:
-        for i, val in enumerate(lst):
-            avg_rolling_base[i] += val
+    max_len = max((len(lst) for lst in all_rolling_globalLS), default=0)
 
-    avg_rolling_score /= np.maximum(count, 1)
-    avg_rolling_base /= np.maximum(count, 1)
+    rolling_df = pd.DataFrame({'window': np.arange(max_len) * 50})
 
+    for i in range(n_runs):
+        rolling_df[f'original_run_{i}'] = [all_rolling_orig[i][j] if j < len(all_rolling_orig[i]) else np.nan 
+                                           for j in range(max_len)]
+        rolling_df[f'globalLS_run_{i}'] = [all_rolling_globalLS[i][j] if j < len(all_rolling_globalLS[i]) else np.nan 
+                                           for j in range(max_len)]
+
+    # Add mean and std
+    rolling_df['original_mean'] = rolling_df[[f'original_run_{i}' for i in range(n_runs)]].mean(axis=1)
+    rolling_df['original_std']  = rolling_df[[f'original_run_{i}' for i in range(n_runs)]].std(axis=1)
+    rolling_df['globalLS_mean'] = rolling_df[[f'globalLS_run_{i}' for i in range(n_runs)]].mean(axis=1)
+    rolling_df['globalLS_std']  = rolling_df[[f'globalLS_run_{i}' for i in range(n_runs)]].std(axis=1)
+
+    rolling_df.to_csv(f"rolling_auc_csv_aif_vs_globalLS/rolling_auc_per_run_{ds_safe}.csv", index=False)
+
+    # Return summary for main CSV
     return {
         'dataset': ds_name,
-        'AUC_ScoreBased_mean': np.mean(auc_score_runs),
-        'AUC_ScoreBased_std': np.std(auc_score_runs),
-        'AUC_Baseline_mean': np.mean(auc_base_runs),
-        'AUC_Baseline_std': np.std(auc_base_runs),
+        'AUC_Original_mean': np.mean(auc_orig_runs),
+        'AUC_Original_std': np.std(auc_orig_runs),
+        'AUC_GlobalLS_mean': np.mean(auc_globalLS_runs),
+        'AUC_GlobalLS_std': np.std(auc_globalLS_runs),
         'Time_mean_sec': np.mean(time_runs),
         'Memory_delta_MB': np.mean(mem_runs),
-        'rolling_auc_score': avg_rolling_score.tolist(),
-        'rolling_auc_base': avg_rolling_base.tolist(),
-        'rolling_windows': (np.arange(max_len) * 50).tolist()
+        'n_runs': n_runs
     }
 
 
-# ========================= Main Parallel Execution =========================
+# ========================= Main Execution =========================
 if __name__ == "__main__":
     DATA_DIR = "./semi_supervised_Datasets"
     datasets = sorted([f for f in os.listdir(DATA_DIR) if f.endswith(".npz")])
@@ -175,7 +196,7 @@ if __name__ == "__main__":
     window_size = 256
     label_budget = 0.025
 
-    print(f"Starting PARALLEL experiment with {n_runs} runs per dataset...")
+    print(f"Starting AIF vs GlobalLS Experiment ({n_runs} runs per dataset)...")
     print(f"Using up to {mp.cpu_count()} CPU cores...\n")
 
     with mp.Pool(processes=mp.cpu_count()) as pool:
@@ -187,53 +208,34 @@ if __name__ == "__main__":
             datasets
         )
 
-    df = pd.DataFrame([{k: v for k, v in r.items() if k not in ['rolling_auc_score', 'rolling_auc_base', 'rolling_windows']} for r in results])
-    df.to_csv("score_vs_baseline_10runs_parallel_summary.csv", index=False)
+    # Save summary
+    df = pd.DataFrame(results)
+    df.to_csv("aif_vs_globalLS_10runs_summary.csv", index=False)
 
-    # ========================= Per-Window AUC Line Plots =========================
-    os.makedirs("auc_plots", exist_ok=True)
-
-    for res in results:
-        ds_safe = res['dataset'].replace('.npz', '').replace('-', '_')
-        windows = np.array(res['rolling_windows'])
-
-        plt.figure(figsize=(12, 6))
-        plt.plot(windows, res['rolling_auc_score'], label='Score-based Top-N', linewidth=2.5)
-        plt.plot(windows, res['rolling_auc_base'], label='Random Baseline', linewidth=2.5)
-        plt.xlabel('Number of Instances Processed')
-        plt.ylabel('Rolling AUC')
-        plt.title(f'Per-Window AUC Evolution (10-run average) - {res["dataset"]}')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(f'auc_plots/per_window_auc_{ds_safe}.png', dpi=300)
-        plt.close()
-
-    # Overall Bar Chart
-    plt.figure(figsize=(14, 7))
+    # Overall Bar Chart (only 2 methods)
+    plt.figure(figsize=(16, 8))
     x = np.arange(len(df))
     width = 0.35
-    plt.bar(x - width/2, df['AUC_ScoreBased_mean'], width, 
-            yerr=df['AUC_ScoreBased_std'], label='Score-based Top-N', capsize=5)
-    plt.bar(x + width/2, df['AUC_Baseline_mean'], width, 
-            yerr=df['AUC_Baseline_std'], label='Random Baseline', capsize=5)
+    plt.bar(x - width/2, df['AUC_Original_mean'], width, 
+            yerr=df['AUC_Original_std'], label='Original AIF', capsize=5)
+    plt.bar(x + width/2, df['AUC_GlobalLS_mean'], width, 
+            yerr=df['AUC_GlobalLS_std'], label='GlobalLS (River)', capsize=5)
 
     plt.xticks(x, df['dataset'], rotation=45, ha='right')
-    plt.ylabel('AUC')
-    plt.title('Overall AUC Comparison (10 runs per dataset - Parallel)')
+    plt.ylabel('Mean AUC')
+    plt.title('Overall AUC Comparison (10 runs) - Original AIF vs GlobalLS (River)')
     plt.legend()
     plt.grid(axis='y', alpha=0.3)
     plt.tight_layout()
-    plt.savefig('auc_comparison_10runs_parallel.png', dpi=300)
+    plt.savefig('aif_vs_globalLS_comparison.png', dpi=300)
     plt.close()
 
-    print("\n" + "="*80)
+    print("\n" + "="*90)
     print("EXPERIMENT COMPLETED SUCCESSFULLY")
-    print("="*80)
+    print("="*90)
     print(df.round(4))
 
     print("\nSaved Files:")
-    print("• Summary CSV          : score_vs_baseline_10runs_parallel_summary.csv")
-    print("• Overall AUC Plot     : auc_comparison_10runs_parallel.png")
-    print("• Per-window AUC Plots : auc_plots/per_window_auc_*.png")
-    print(f"CPU Cores Used         : {mp.cpu_count()}")
+    print("• Summary CSV                  : aif_vs_globalLS_10runs_summary.csv")
+    print("• Per-run Rolling AUC CSVs     : rolling_auc_csv_aif_vs_globalLS/rolling_auc_per_run_*.csv")
+    print("• Overall AUC Plot             : aif_vs_globalLS_comparison.png")

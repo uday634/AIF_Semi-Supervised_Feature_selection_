@@ -13,7 +13,7 @@ import pandas as pd
 
 from capymoa.instance import Instance
 from capymoa.stream import Schema
-from capymoa.anomaly.adaptive_isolation_forest_logistic_fs import AdaptiveIsolationForestWithLogisticFS
+from capymoa.anomaly.adaptive_isolation_forest_logistic_fs_with_buffer import AdaptiveIsolationForestWithLogisticFS
 from capymoa.anomaly.adaptive_isolation_forest_anova_fs import AdaptiveIsolationForestWithAnovaFS
 
 # ────────────────────────────────────────────────────────────────

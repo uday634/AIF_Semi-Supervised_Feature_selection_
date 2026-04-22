@@ -16,7 +16,7 @@ from sklearn.preprocessing import LabelEncoder
 from capymoa.instance import Instance
 from capymoa.stream import Schema
 from capymoa.anomaly._adaptive_isolation_forest import AdaptiveIsolationForest
-from capymoa.anomaly.adaptive_isolation_forest_logistic_fs import (
+from capymoa.anomaly.adaptive_isolation_forest_logistic_fs_with_buffer import (
     AdaptiveIsolationForestWithLogisticFS
 )
 
