@@ -1,8 +1,8 @@
-# experiment_aif_vs_globalLS.py
-# UPDATED: Only compare Original AIF vs Global Logistic Selection (River)
+# experiment_aif_vs_adaptive.py
+# Compares Original AIF vs AdaptiveIsolationForestWithLogisticFS (with m_trees)
+
 import os
 import time
-import psutil
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -11,35 +11,55 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, auc
 from sklearn.preprocessing import LabelEncoder
 import multiprocessing as mp
-from functools import partial
+from tqdm import tqdm
 
 from capymoa.instance import Instance
 from capymoa.stream import Schema
 
-# ====================== Import Models ======================
+# Original AIF
 from capymoa.anomaly._adaptive_isolation_forest import AdaptiveIsolationForest as OriginalAIF
 
-# Global Logistic Selection (River-based - the global/online version)
-from capymoa.anomaly.AdaptiveIsolationForestWithLogisticFSGlobal import AdaptiveIsolationForestWithLogisticFS
+# Your Adaptive version with m_trees
+from capymoa.anomaly.AdaptiveIsolationForestWithLogisticFSGlobal_Active import AdaptiveIsolationForestWithGlobalLR
 
 
+# ========================= CONFIG =========================
+DATA_DIR = "./semi_supervised_Datasets"
+
+N_RUNS = 10
+WINDOW_SIZE = 256
+LABEL_BUDGET = 0.025
+L1_STRENGTH = 1.0
+
+N_TREES = 80        # Number of trees in ensemble
+M_TREES = 10        # Number of candidate trees per window (for your adaptive model)
+
+ROLLING_FREQ = 200
+
+# Output files
+SUMMARY_CSV = "aif_vs_adaptive_summary.csv"
+PER_RUN_CSV = "aif_vs_adaptive_per_run_auc.csv"
+PLOT_BAR = "aif_vs_adaptive_bar.png"
+
+
+# ========================= STREAM =========================
 class NPZStream:
     def __init__(self, path):
         data = np.load(path)
         X = data["X"].astype(np.float64)
         y = data["y"].ravel()
 
-        self.le = LabelEncoder()
-        y_idx = self.le.fit_transform(y)
+        le = LabelEncoder()
+        y_idx = le.fit_transform(y)
 
         self.n = len(X)
         self.i = 0
 
-        feature_names = [f"feature_{j}" for j in range(X.shape[1])]
+        feat_names = [f"feature_{j}" for j in range(X.shape[1])]
         self.schema = Schema.from_custom(
-            features=feature_names + ["class"],
+            features=feat_names + ["class"],
             target="class",
-            categories={"class": [str(cls) for cls in self.le.classes_]},
+            categories={"class": [str(c) for c in le.classes_]},
             name=os.path.basename(path)
         )
         self.data = list(zip(X, y_idx))
@@ -54,188 +74,135 @@ class NPZStream:
         return inst, y
 
 
-def run_single_dataset(ds_name, label_budget=0.025, n_runs=10, window_size=256):
-    """Run one dataset comparing Original AIF vs GlobalLS (River)"""
-    path = os.path.join("./semi_supervised_Datasets", ds_name)
+def safe_auc(y, scores):
+    if len(np.unique(y)) > 1:
+        fpr, tpr, _ = roc_curve(y, scores)
+        return auc(fpr, tpr)
+    return 0.5
 
-    auc_orig_runs = []
-    auc_globalLS_runs = []
-    time_runs = []
-    mem_runs = []
 
-    # Store per-run rolling AUCs for variance analysis
-    all_rolling_orig = []
-    all_rolling_globalLS = []
+# ========================= WORKER =========================
+def run_single(args):
+    ds_name, run = args
+    seed = 42 + run * 13
 
-    for run in range(n_runs):
-        stream = NPZStream(path)
-        seed = 42 + run * 13
+    stream = NPZStream(os.path.join(DATA_DIR, ds_name))
 
-        # ====================== Initialize Models ======================
-        model_orig = OriginalAIF(
-            schema=stream.schema,
-            window_size=window_size,
-            n_trees=100,
-            seed=seed
-        )
+    # Original AIF
+    model_orig = OriginalAIF(
+        schema=stream.schema,
+        window_size=WINDOW_SIZE,
+        n_trees=N_TREES,
+        seed=seed
+    )
 
-        model_globalLS = AdaptiveIsolationForestWithLogisticFS(
-            schema=stream.schema,
-            window_size=window_size,
-            n_trees=100,
-            seed=seed,
-            label_budget=label_budget,
-            l1_strength=0.1          # River L1 strength (tunable)
-        )
+    # Your Adaptive model with m_trees
+    model_adapt = AdaptiveIsolationForestWithGlobalLR(
+        schema=stream.schema,
+        window_size=WINDOW_SIZE,
+        n_trees=N_TREES,
+        m_trees=M_TREES,
+        seed=seed,
+        label_budget=LABEL_BUDGET,
+        l1_strength=L1_STRENGTH
+    )
 
-        y_true = []
-        scores_orig = []
-        scores_globalLS = []
+    y_true = []
+    scores_orig = []
+    scores_adapt = []
 
-        rolling_y = []
-        rolling_orig = []
-        rolling_globalLS = []
+    step = 0
 
-        run_rolling_orig = []
-        run_rolling_globalLS = []
+    while stream.has_more_instances():
+        inst, y = stream.next_instance()
+        step += 1
 
-        start_time = time.time()
-        start_mem = psutil.Process().memory_info().rss / (1024 * 1024)
+        s_o = model_orig.score_instance(inst)
+        s_a = model_adapt.score_instance(inst)
 
-        while stream.has_more_instances():
-            inst, true_y = stream.next_instance()
+        y_true.append(y)
+        scores_orig.append(s_o)
+        scores_adapt.append(s_a)
 
-            y_true.append(true_y)
-            rolling_y.append(true_y)
+        model_orig.train(inst)
+        model_adapt.train(inst, y)
 
-            # Score instances
-            s_orig = model_orig.score_instance(inst)
-            s_globalLS = model_globalLS.score_instance(inst)
+    final_auc_orig = safe_auc(y_true, scores_orig)
+    final_auc_adapt = safe_auc(y_true, scores_adapt)
 
-            scores_orig.append(s_orig)
-            scores_globalLS.append(s_globalLS)
-
-            rolling_orig.append(s_orig)
-            rolling_globalLS.append(s_globalLS)
-
-            # Train models
-            model_orig.train(inst)
-            model_globalLS.train(inst, true_y)   # GlobalLS learns online on labeled data
-
-            # Rolling AUC every 50 instances
-            if len(rolling_y) % 50 == 0 and len(np.unique(rolling_y)) > 1:
-                fpr, tpr, _ = roc_curve(rolling_y, rolling_orig)
-                auc_o = auc(fpr, tpr)
-
-                fpr, tpr, _ = roc_curve(rolling_y, rolling_globalLS)
-                auc_g = auc(fpr, tpr)
-
-                run_rolling_orig.append(auc_o)
-                run_rolling_globalLS.append(auc_g)
-
-        # Record time and memory
-        elapsed = time.time() - start_time
-        mem_delta = psutil.Process().memory_info().rss / (1024 * 1024) - start_mem
-
-        # Final AUC
-        def safe_auc(y_true, scores):
-            if len(np.unique(y_true)) > 1:
-                fpr, tpr, _ = roc_curve(y_true, scores)
-                return auc(fpr, tpr)
-            return 0.5
-
-        auc_orig_runs.append(safe_auc(y_true, scores_orig))
-        auc_globalLS_runs.append(safe_auc(y_true, scores_globalLS))
-        time_runs.append(elapsed)
-        mem_runs.append(mem_delta)
-
-        all_rolling_orig.append(run_rolling_orig)
-        all_rolling_globalLS.append(run_rolling_globalLS)
-
-    # ====================== Save Per-Run Rolling AUC to CSV ======================
-    os.makedirs("rolling_auc_csv_aif_vs_globalLS", exist_ok=True)
-    ds_safe = ds_name.replace('.npz', '').replace('-', '_').replace('.', '_')
-
-    max_len = max((len(lst) for lst in all_rolling_globalLS), default=0)
-
-    rolling_df = pd.DataFrame({'window': np.arange(max_len) * 50})
-
-    for i in range(n_runs):
-        rolling_df[f'original_run_{i}'] = [all_rolling_orig[i][j] if j < len(all_rolling_orig[i]) else np.nan 
-                                           for j in range(max_len)]
-        rolling_df[f'globalLS_run_{i}'] = [all_rolling_globalLS[i][j] if j < len(all_rolling_globalLS[i]) else np.nan 
-                                           for j in range(max_len)]
-
-    # Add mean and std
-    rolling_df['original_mean'] = rolling_df[[f'original_run_{i}' for i in range(n_runs)]].mean(axis=1)
-    rolling_df['original_std']  = rolling_df[[f'original_run_{i}' for i in range(n_runs)]].std(axis=1)
-    rolling_df['globalLS_mean'] = rolling_df[[f'globalLS_run_{i}' for i in range(n_runs)]].mean(axis=1)
-    rolling_df['globalLS_std']  = rolling_df[[f'globalLS_run_{i}' for i in range(n_runs)]].std(axis=1)
-
-    rolling_df.to_csv(f"rolling_auc_csv_aif_vs_globalLS/rolling_auc_per_run_{ds_safe}.csv", index=False)
-
-    # Return summary for main CSV
     return {
-        'dataset': ds_name,
-        'AUC_Original_mean': np.mean(auc_orig_runs),
-        'AUC_Original_std': np.std(auc_orig_runs),
-        'AUC_GlobalLS_mean': np.mean(auc_globalLS_runs),
-        'AUC_GlobalLS_std': np.std(auc_globalLS_runs),
-        'Time_mean_sec': np.mean(time_runs),
-        'Memory_delta_MB': np.mean(mem_runs),
-        'n_runs': n_runs
+        "dataset": ds_name,
+        "run": run,
+        "auc_orig": final_auc_orig,
+        "auc_adapt": final_auc_adapt
     }
 
 
-# ========================= Main Execution =========================
+# ========================= MAIN =========================
 if __name__ == "__main__":
-    DATA_DIR = "./semi_supervised_Datasets"
     datasets = sorted([f for f in os.listdir(DATA_DIR) if f.endswith(".npz")])
+    tasks = [(ds, run) for ds in datasets for run in range(N_RUNS)]
 
-    n_runs = 10
-    window_size = 256
-    label_budget = 0.025
+    print(f"Starting AIF vs Adaptive (m_trees) Experiment")
+    print(f"Datasets: {len(datasets)} | Runs: {N_RUNS} | Total tasks: {len(tasks)}\n")
 
-    print(f"Starting AIF vs GlobalLS Experiment ({n_runs} runs per dataset)...")
-    print(f"Using up to {mp.cpu_count()} CPU cores...\n")
-
+    results = []
     with mp.Pool(processes=mp.cpu_count()) as pool:
-        results = pool.map(
-            partial(run_single_dataset,
-                    label_budget=label_budget,
-                    n_runs=n_runs,
-                    window_size=window_size),
-            datasets
-        )
+        for res in tqdm(pool.imap_unordered(run_single, tasks), total=len(tasks), desc="Running"):
+            results.append(res)
 
-    # Save summary
-    df = pd.DataFrame(results)
-    df.to_csv("aif_vs_globalLS_10runs_summary.csv", index=False)
+    # ====================== Summary ======================
+    summary = []
+    for ds in datasets:
+        ds_res = [r for r in results if r["dataset"] == ds]
+        auc_orig = [r["auc_orig"] for r in ds_res]
+        auc_adapt = [r["auc_adapt"] for r in ds_res]
 
-    # Overall Bar Chart (only 2 methods)
-    plt.figure(figsize=(16, 8))
+        summary.append({
+            "dataset": ds,
+            "AUC_Original_mean": np.mean(auc_orig),
+            "AUC_Original_std": np.std(auc_orig),
+            "AUC_Adaptive_mean": np.mean(auc_adapt),
+            "AUC_Adaptive_std": np.std(auc_adapt),
+        })
+
+    df = pd.DataFrame(summary)
+    df.to_csv(SUMMARY_CSV, index=False)
+
+    # Per-run final AUCs
+    per_run = []
+    for r in results:
+        per_run.append({
+            "dataset": r["dataset"],
+            "run": r["run"],
+            "AUC_Original": r["auc_orig"],
+            "AUC_Adaptive": r["auc_adapt"]
+        })
+    pd.DataFrame(per_run).to_csv(PER_RUN_CSV, index=False)
+
+    print("\nFinal AUC Summary:")
+    print(df.round(4))
+
+    # ====================== Bar Plot ======================
     x = np.arange(len(df))
     width = 0.35
-    plt.bar(x - width/2, df['AUC_Original_mean'], width, 
-            yerr=df['AUC_Original_std'], label='Original AIF', capsize=5)
-    plt.bar(x + width/2, df['AUC_GlobalLS_mean'], width, 
-            yerr=df['AUC_GlobalLS_std'], label='GlobalLS (River)', capsize=5)
 
-    plt.xticks(x, df['dataset'], rotation=45, ha='right')
-    plt.ylabel('Mean AUC')
-    plt.title('Overall AUC Comparison (10 runs) - Original AIF vs GlobalLS (River)')
+    plt.figure(figsize=(14, 7))
+    plt.bar(x - width/2, df['AUC_Original_mean'], width, yerr=df['AUC_Original_std'],
+            label='Original AIF', capsize=5)
+    plt.bar(x + width/2, df['AUC_Adaptive_mean'], width, yerr=df['AUC_Adaptive_std'],
+            label='Adaptive AIF (m_trees)', capsize=5)
+
+    plt.xticks(x, [d.replace('.npz', '') for d in df['dataset']], rotation=45, ha='right')
+    plt.ylabel("Mean AUC")
+    plt.title(f"Original AIF vs Adaptive AIF with m_trees (label_budget={LABEL_BUDGET})")
     plt.legend()
     plt.grid(axis='y', alpha=0.3)
     plt.tight_layout()
-    plt.savefig('aif_vs_globalLS_comparison.png', dpi=300)
+    plt.savefig(PLOT_BAR, dpi=300)
     plt.close()
 
-    print("\n" + "="*90)
-    print("EXPERIMENT COMPLETED SUCCESSFULLY")
-    print("="*90)
-    print(df.round(4))
-
-    print("\nSaved Files:")
-    print("• Summary CSV                  : aif_vs_globalLS_10runs_summary.csv")
-    print("• Per-run Rolling AUC CSVs     : rolling_auc_csv_aif_vs_globalLS/rolling_auc_per_run_*.csv")
-    print("• Overall AUC Plot             : aif_vs_globalLS_comparison.png")
+    print(f"\nBar plot saved: {PLOT_BAR}")
+    print(f"Summary CSV   : {SUMMARY_CSV}")
+    print(f"Per-run CSV   : {PER_RUN_CSV}")
+    print("\n✅ Experiment completed successfully!")
