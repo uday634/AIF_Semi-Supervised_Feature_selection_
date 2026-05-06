@@ -20,7 +20,7 @@ from capymoa.stream import Schema
 from capymoa.anomaly._adaptive_isolation_forest import AdaptiveIsolationForest as OriginalAIF
 
 # Your Adaptive version with m_trees
-from capymoa.anomaly.AdaptiveIsolationForestWithLogisticFSGlobal_Active import AdaptiveIsolationForestWithGlobalLR
+from capymoa.anomaly.adaptive_isolation_forest_logistic_fs_with_activeLearning_Tournament import AdaptiveIsolationForestWithGlobalLRActiveTournament
 
 
 # ========================= CONFIG =========================
@@ -39,7 +39,7 @@ ROLLING_FREQ = 200
 # Output files
 SUMMARY_CSV = "aif_vs_adaptive_summary.csv"
 PER_RUN_CSV = "aif_vs_adaptive_per_run_auc.csv"
-PLOT_BAR = "aif_vs_adaptive_bar.png"
+PLOT_BAR = "aif_vs_adaptive_bar_TopN_Active.png"
 
 
 # ========================= STREAM =========================
@@ -97,7 +97,7 @@ def run_single(args):
     )
 
     # Your Adaptive model with m_trees
-    model_adapt = AdaptiveIsolationForestWithGlobalLR(
+    model_adapt = AdaptiveIsolationForestWithGlobalLRActiveTournament(
         schema=stream.schema,
         window_size=WINDOW_SIZE,
         n_trees=N_TREES,
@@ -143,7 +143,7 @@ if __name__ == "__main__":
     datasets = sorted([f for f in os.listdir(DATA_DIR) if f.endswith(".npz")])
     tasks = [(ds, run) for ds in datasets for run in range(N_RUNS)]
 
-    print(f"Starting AIF vs Adaptive (m_trees) Experiment")
+    print(f"Starting AIF vs AIF Tournament (N = 4) Experiment")
     print(f"Datasets: {len(datasets)} | Runs: {N_RUNS} | Total tasks: {len(tasks)}\n")
 
     results = []
@@ -191,11 +191,11 @@ if __name__ == "__main__":
     plt.bar(x - width/2, df['AUC_Original_mean'], width, yerr=df['AUC_Original_std'],
             label='Original AIF', capsize=5)
     plt.bar(x + width/2, df['AUC_Adaptive_mean'], width, yerr=df['AUC_Adaptive_std'],
-            label='Adaptive AIF (m_trees)', capsize=5)
+            label='AIF Tournament (N = 4)', capsize=5)
 
     plt.xticks(x, [d.replace('.npz', '') for d in df['dataset']], rotation=45, ha='right')
     plt.ylabel("Mean AUC")
-    plt.title(f"Original AIF vs Adaptive AIF with m_trees (label_budget={LABEL_BUDGET})")
+    plt.title(f"Original AIF vs AIF (Top N) (label_budget={LABEL_BUDGET})")
     plt.legend()
     plt.grid(axis='y', alpha=0.3)
     plt.tight_layout()
