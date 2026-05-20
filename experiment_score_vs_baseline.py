@@ -25,8 +25,8 @@ from capymoa.anomaly._adaptive_isolation_forest import (
 )
 
 # ================= TOP-N MODEL =================
-from capymoa.anomaly.adaptive_isolation_forest_logistic_fs_active import (
-    AdaptiveIsolationForestWithWindowLRTopN
+from capymoa.anomaly.adaptive_isolation_forest_logistic_fs import (
+    AdaptiveIsolationForestWithLogisticFS
 )
 
 # =========================================================
@@ -136,7 +136,7 @@ def run_single(args):
     )
 
     # ================= TOP-N MODEL =================
-    model_topn = AdaptiveIsolationForestWithWindowLRTopN(
+    model_topn = AdaptiveIsolationForestWithLogisticFS(
         schema=stream.schema,
         window_size=WINDOW_SIZE,
         n_trees=N_TREES,
@@ -196,7 +196,7 @@ if __name__ == "__main__":
     ]
 
     print("=" * 60)
-    print("AIF vs TOP-N WINDOW EXPERIMENT")
+    print("AIF vs WRFS")
     print("=" * 60)
 
     results = []
@@ -226,10 +226,10 @@ if __name__ == "__main__":
             "AUC_Original_std":
                 np.std([r["auc_orig"] for r in ds_res]),
 
-            "AUC_TopN_mean":
+            "WRFS":
                 np.mean([r["auc_topn"] for r in ds_res]),
 
-            "AUC_TopN_std":
+            "WRFS_std":
                 np.std([r["auc_topn"] for r in ds_res]),
         })
 
@@ -273,7 +273,7 @@ if __name__ == "__main__":
         df["AUC_TopN_mean"],
         width,
         yerr=df["AUC_TopN_std"],
-        label="Top-N Window AIF",
+        label="RANDOM WINDOW AIF",
         capsize=5
     )
 
@@ -285,7 +285,7 @@ if __name__ == "__main__":
     )
 
     plt.ylabel("Mean AUC")
-    plt.title(f"Original vs Top-N Window AIF (budget={LABEL_BUDGET})")
+    plt.title(f"Original vs Random Window AIF (budget={LABEL_BUDGET})")
     plt.legend()
     plt.grid(axis="y", alpha=0.3)
 
